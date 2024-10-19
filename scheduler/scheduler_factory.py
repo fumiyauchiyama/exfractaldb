@@ -33,9 +33,9 @@ def create_scheduler(args, optimizer, iter_per_epoch=1):
         lr_scheduler = CosineLRScheduler(
             optimizer,
             t_initial=num_epochs,
-            t_mul=getattr(args, 'lr_cycle_mul', 1.),
+            cycle_mul=getattr(args, 'lr_cycle_mul', 1.),
             lr_min=args.min_lr,
-            decay_rate=args.decay_rate,
+            cycle_decay=args.decay_rate,
             warmup_lr_init=args.warmup_lr,
             warmup_t=args.warmup_epochs,
             cycle_limit=getattr(args, 'lr_cycle_limit', 1),
@@ -67,7 +67,7 @@ def create_scheduler(args, optimizer, iter_per_epoch=1):
         lr_scheduler = TanhLRScheduler(
             optimizer,
             t_initial=num_epochs,
-            t_mul=getattr(args, 'lr_cycle_mul', 1.),
+            cycle_mul=getattr(args, 'lr_cycle_mul', 1.),
             lr_min=args.min_lr,
             warmup_lr_init=args.warmup_lr,
             warmup_t=args.warmup_epochs,
@@ -114,9 +114,9 @@ def create_scheduler(args, optimizer, iter_per_epoch=1):
         lr_scheduler = CosineLRScheduler(
             optimizer,
             t_initial=num_epochs * iter_per_epoch,
-            t_mul=getattr(args, 'lr_cycle_mul', 1.),
+            cycle_mul=getattr(args, 'lr_cycle_mul', 1.),
             lr_min=args.min_lr,
-            decay_rate=args.decay_rate,
+            cycle_decay=args.decay_rate,
             warmup_lr_init=args.warmup_lr,
             warmup_t=warmup_t,
             cycle_limit=getattr(args, 'lr_cycle_limit', 1),

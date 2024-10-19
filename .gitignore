@@ -1,1 +1,7 @@
 .DS_Store
+*.sh.o[0-9]*
+wandb
+.venv
+dataset
+output
+__pycache__
