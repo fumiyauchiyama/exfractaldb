@@ -55,18 +55,19 @@ If you use this code, please cite the following paper:
 
 ## Requirements
 
-* Python 3.x (worked at 3.7)
-* Pytorch 1.x (worked at 1.6.0)
-* CUDA (worked at 10.2)
-* CuDNN (worked at 8.0)
-* OpenMPI (worked at 4.0.5)
+* Python 3.x (worked at 3.10.14)
+* Pytorch 2.x (worked at 2.4.1+cu121)
+* CUDA (worked at 12.1)
+* CuDNN (worked at 9.0.0)
+* OpenMPI (worked at hpcx/2.12, nccl/2.17.1-1)
 * Graphic board (worked at single/four NVIDIA V100)
 
-Please install packages with the following command. (use conda env)
+Please install packages with the following command. (use venv)
 
 ```bash
-$ conda env create -f conda_requirements.yaml
-$ conda activate cvpr2022_env
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
 * Fine-tuning datasets
