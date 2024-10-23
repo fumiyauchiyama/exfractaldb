@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-""" Fine-tune Python Script
+""" Mixed-Train Python Script
 Heavily based on the training script provided by timm.
 
 Title: pytorch-image-models
@@ -24,21 +24,67 @@ import torchvision.utils
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
 
 from timm.data import create_dataset, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
-from timm.models import resume_checkpoint, load_checkpoint, model_parameters
-from timm.models.layers import convert_splitbn_model
+from timm.models import resume_checkpoint, model_parameters
 from timm.utils import *
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy, JsdCrossEntropy
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.utils import ApexScaler, NativeScaler
 
-from data.loader import create_loader
+import webdataset as wds
+import torch.distributed as dist
+
+from data.loader import create_loader, create_transform_webdataset
 from models.factory import create_model, safe_model_name
 from scheduler.scheduler_factory import create_scheduler
 from utils.summary import original_update_summary
 
+
+def print0(message):
+    if dist.is_initialized():
+        if dist.get_rank() == 0:
+            print(message, flush=True)
+    else:
+        print(message, flush=True)
+
+
+class OffsetDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset, label_offset=0):
+        self.dataset = dataset
+        self.label_offset = label_offset
+    def __getitem__(self, index):
+        data, label = self.dataset[index]
+        return data, label + self.label_offset
+    def __len__(self):
+        return len(self.dataset)
+    def __getattr__(self, name):
+        return getattr(self.dataset, name)
+    def __setattr__(self, name, value):
+        if name in ['dataset', 'label_offset']:
+            super().__setattr__(name, value)
+        else:
+            setattr(self.dataset, name, value)
+
+class ConcatDatasetWithAttrs(torch.utils.data.ConcatDataset):
+    def __init__(self, datasets):
+        super().__init__(datasets)
+    def __getattr__(self, name):
+        """
+        ConcatDataset 内の最初のデータセットの属性にアクセスできるようにする。
+        全てのデータセットが同じ属性を持つことが前提
+        """
+        return getattr(self.datasets[0], name)
+    def __setattr__(self, name, value):
+        if name == 'datasets':
+            super().__setattr__(name, value)
+        else:
+            for ds in self.datasets:
+                setattr(ds, name, value)
+
+
 try:
     from apex import amp
     from apex.parallel import DistributedDataParallel as ApexDDP
+
     has_apex = True
 except ImportError:
     has_apex = False
@@ -52,21 +98,24 @@ except AttributeError:
 
 try:
     import wandb
+
     has_wandb = True
-except ImportError: 
+except ImportError:
     has_wandb = False
 
 torch.backends.cudnn.benchmark = True
 _logger = logging.getLogger('train')
 
 
-parser = argparse.ArgumentParser(description='FineTuning')
+parser = argparse.ArgumentParser(description='MixedTraining')
 
 # Dataset / Model parameters
-parser.add_argument('data_dir', metavar='DIR',
-                    help='path to dataset')
-parser.add_argument('--dataset', '-d', metavar='NAME', default='',
-                    help='dataset type (default: ImageFolder/ImageTar if empty)')
+parser.add_argument('data_dir', metavar='DIR', nargs='*', 
+                    help='path to train dataset, do not used when using WebDataSet')
+parser.add_argument('--dataset', '-d', metavar='NAME', default=[''], nargs='*', 
+                    help='train dataset type (default: ImageFolder/ImageTar if empty)')
+parser.add_argument('--use-train-eval', type=int, default=[], metavar='N', nargs='*',
+                    help='specify 1 for using to both train and eval. Other integers for using only to train.')
 parser.add_argument('--train-split', metavar='NAME', default='train',
                     help='dataset train split (default: train)')
 parser.add_argument('--val-split', metavar='NAME', default='validation',
@@ -75,19 +124,17 @@ parser.add_argument('--model', default='deit_tiny_patch16_224', type=str, metava
                     help='Name of model to train (default: deit_tiny_patch16_224)')
 parser.add_argument('--pretrained', action='store_true', default=False,
                     help='Start with pretrained version of specified network (if avail)')
-parser.add_argument('--pretrained-path', default='', type=str, metavar='PATH',
-                    help='Load model from local pretrained checkpoint')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='Resume full model and optimizer state from checkpoint (default: none)')
 parser.add_argument('--no-resume-opt', action='store_true', default=False,
                     help='prevent resume of optimizer state when resuming model')
-parser.add_argument('--num-classes', type=int, default=None, metavar='N',
+parser.add_argument('--num-classes', type=int, default=[], metavar='N', nargs='*',
                     help='number of label classes (Model default if None)')
 parser.add_argument('--img-size', type=int, default=None, metavar='N',
                     help='Image patch size (default: None => model default)')
-parser.add_argument('--input-size', default=None, nargs=3, type=int, metavar='N N N', 
+parser.add_argument('--input-size', default=None, nargs=3, type=int, metavar='N N N',
                     help='Input all image dimensions (d h w, e.g. --input-size 3 224 224), uses model default if empty')
-parser.add_argument('--crop-pct', default=None, type=float, metavar='N', 
+parser.add_argument('--crop-pct', default=None, type=float, metavar='N',
                     help='Input image center crop percent (for validation only)')
 parser.add_argument('--mean', type=float, nargs='+', default=None, metavar='MEAN',
                     help='Override mean pixel value of dataset')
@@ -99,6 +146,14 @@ parser.add_argument('-b', '--batch-size', type=int, default=32, metavar='N',
                     help='input batch size for training (default: 32)')
 parser.add_argument('-vb', '--validation-batch-size-multiplier', type=int, default=1, metavar='N',
                     help='ratio of validation batch size to training batch size (default: 1)')
+
+# Web Datasets
+parser.add_argument('--trainshards', default=None,
+                    help='path/URL for ImageNet shards')
+parser.add_argument('-w', '--webdataset', action='store_true', default=False,
+                    help='Using webdata to create DataSet from .tar files')
+parser.add_argument('--dataset_size', default=None, type=int,
+                    help='Number of Images in the dataset, set to num_classes * 1000 if None')
 
 # Optimizer parameters
 parser.add_argument('--opt', default='sgd', type=str, metavar='OPTIMIZER',
@@ -314,18 +369,23 @@ def main():
             _logger.warning("You've requested to log metrics to wandb but package not found. "
                             "Metrics not being logged to wandb, try `pip install wandb`")
 
+    global_class_num = None
+    if len(args.num_classes) > 0:
+        global_class_num = 0
+        for i in args.num_classes:
+            global_class_num += i
+
     model = create_model(
         args.model,
         pretrained=args.pretrained,
-        num_classes=args.num_classes,
+        num_classes=global_class_num,
         drop_rate=args.drop,
         drop_connect_rate=args.drop_connect,  # DEPRECATED, use drop_path
         drop_path_rate=args.drop_path,
-        drop_block_rate=args.drop_block,
-        pretrained_path=args.pretrained_path)
-    if args.num_classes is None:
+        drop_block_rate=args.drop_block)
+    if global_class_num is None:
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
-        args.num_classes = model.num_classes  # FIXME handle model default vs config num_classes more elegantly
+        global_class_num = model.num_classes  # FIXME handle model default vs config num_classes more elegantly
 
     if args.rank == 0:
         _logger.info(
@@ -371,7 +431,7 @@ def main():
             optimizer=None if args.no_resume_opt else optimizer,
             loss_scaler=None if args.no_resume_opt else loss_scaler,
             log_info=args.rank == 0)
-    if args.rank == 0:
+        if args.rank == 0:
             _logger.info('resume epoch: {}'.format(resume_epoch))
 
     # setup distributed training
@@ -386,79 +446,180 @@ def main():
                 _logger.info("Using native Torch DistributedDataParallel.")
             model = NativeDDP(model, device_ids=[args.local_rank])  # can use device str in Torch >= 1.1
 
-    # create the train and eval datasets
-    dataset_train = create_dataset(
-        args.dataset,
-        root=args.data_dir, split=args.train_split, is_training=True,
-        batch_size=args.batch_size, repeats=args.epoch_repeats)
-    dataset_eval = create_dataset(
-        args.dataset, root=args.data_dir, split=args.val_split, is_training=False, batch_size=args.batch_size)
+    # Choose the DataSet Selector
+    if args.webdataset:
+        raise NotImplementedError
+        # print0("\n\n=> Loading DataSet with WebDataset using .tars")
+        # collate_fn = None
+        # mixup_fn = None
+        # mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
+        # if mixup_active:
+        #     mixup_args = dict(
+        #         mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
+        #         prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
+        #         label_smoothing=args.smoothing, num_classes=args.num_classes)
+        #     if args.prefetcher:
+        #         assert not num_aug_splits  # collate conflict (need to support deinterleaving in collate mixup)
+        #         collate_fn = FastCollateMixup(**mixup_args)
+        #     else:
+        #         mixup_fn = Mixup(**mixup_args)
 
-    # setup mixup / cutmix
-    collate_fn = None
-    mixup_fn = None
-    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
-    if mixup_active:
-        mixup_args = dict(
-            mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
-            prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
-            label_smoothing=args.smoothing, num_classes=args.num_classes)
-        if args.prefetcher:
-            assert not num_aug_splits  # collate conflict (need to support deinterleaving in collate mixup)
-            collate_fn = FastCollateMixup(**mixup_args)
-        else:
-            mixup_fn = Mixup(**mixup_args)
+        # # Transforms from Torchvision
+        # # create data loaders w/ augmentation pipeline
+        # train_interpolation = args.train_interpolation
+        # if args.no_aug or not train_interpolation:
+        #     train_interpolation = data_config['interpolation']
+        # transform_train = create_transform_webdataset(
+        #     input_size=data_config['input_size'],
+        #     batch_size=args.batch_size,
+        #     is_training=True,
+        #     use_prefetcher=args.prefetcher,
+        #     no_aug=args.no_aug,
+        #     re_prob=args.reprob,
+        #     re_mode=args.remode,
+        #     re_count=args.recount,
+        #     re_split=args.resplit,
+        #     scale=args.scale,
+        #     ratio=args.ratio,
+        #     hflip=args.hflip,
+        #     vflip=args.vflip,
+        #     color_jitter=args.color_jitter,
+        #     auto_augment=args.aa,
+        #     num_aug_splits=num_aug_splits,
+        #     interpolation=train_interpolation,
+        #     mean=data_config['mean'],
+        #     std=data_config['std'],
+        #     num_workers=args.workers,
+        #     distributed=args.distributed,
+        #     collate_fn=collate_fn,
+        #     pin_memory=args.pin_mem,
+        #     repeated_aug=args.repeated_aug
+        # )
 
-    # wrap dataset in AugMix helper
-    if num_aug_splits > 1:
-        dataset_train = AugMixDataset(dataset_train, num_splits=num_aug_splits)
+        # if args.dataset_size:
+        #     dataset_size = args.dataset_size
+        # elif "_2ki" in args.trainshards:
+        #     dataset_size = args.num_classes * 2000
+        # else:
+        #     dataset_size = args.num_classes * 1000
 
-    # create data loaders w/ augmentation pipeiine
-    train_interpolation = args.train_interpolation
-    if args.no_aug or not train_interpolation:
-        train_interpolation = data_config['interpolation']
-    loader_train = create_loader(
-        dataset_train,
-        input_size=data_config['input_size'],
-        batch_size=args.batch_size,
-        is_training=True,
-        use_prefetcher=args.prefetcher,
-        no_aug=args.no_aug,
-        re_prob=args.reprob,
-        re_mode=args.remode,
-        re_count=args.recount,
-        re_split=args.resplit,
-        scale=args.scale,
-        ratio=args.ratio,
-        hflip=args.hflip,
-        vflip=args.vflip,
-        color_jitter=args.color_jitter,
-        auto_augment=args.aa,
-        num_aug_splits=num_aug_splits,
-        interpolation=train_interpolation,
-        mean=data_config['mean'],
-        std=data_config['std'],
-        num_workers=args.workers,
-        distributed=args.distributed,
-        collate_fn=collate_fn,
-        pin_memory=args.pin_mem,
-        repeated_aug=args.repeated_aug
-    )
+        # train_dataset = (
+        #     wds.Dataset(args.trainshards)
+        #         .shuffle(dataset_size)
+        #         .decode("pil")
+        #         .rename(image="jpg;jpeg;JPEG;png", target="cls")
+        #         .map_dict(image=transform_train)
+        #         .to_tuple("image", "target")
+        # )
+        # loader_train = wds.WebLoader(train_dataset, batch_size=None, shuffle=False, num_workers=args.workers)
+        # train_dataset = train_dataset.batched(args.batch_size, partial=False)
 
-    loader_eval = create_loader(
-        dataset_eval,
-        input_size=data_config['input_size'],
-        batch_size=args.validation_batch_size_multiplier * args.batch_size,
-        is_training=False,
-        use_prefetcher=args.prefetcher,
-        interpolation=data_config['interpolation'],
-        mean=data_config['mean'],
-        std=data_config['std'],
-        num_workers=args.workers,
-        distributed=args.distributed,
-        crop_pct=data_config['crop_pct'],
-        pin_memory=args.pin_mem,
-    )
+        # number_of_batches = dataset_size // (args.batch_size * args.world_size)
+        # print0("dataset_size:{}, batch_size:{}, world_size(Total Devices):{}".format(dataset_size, args.batch_size,
+        #                                                                                 args.world_size))
+        # print0("----> Number of batches to be processed per GPU = {}".format(number_of_batches))
+        # loader_train = loader_train.repeat(2).slice(number_of_batches)
+        # # This only sets the value returned by the len() function; nothing else uses it,
+        # # but some frameworks care about it.
+        # loader_train.length = number_of_batches
+
+    else:
+        # create datasets with timm's dataloader
+        assert (len(args.dataset) == len(args.data_dir) == len(args.use_train_eval) == len(args.num_classes)), \
+            "The number of --dataset, --data_dir, --use_train_eval, and --num_classes arguments must be the same."
+
+        combined_train_dataset = []
+        combined_eval_dataset = []
+        num_class_idx = 0
+        for dataset, data_dir, num_classes, use_train_eval in zip(
+            args.dataset, args.data_dir, args.num_classes, args.use_train_eval, strict=True
+            ):
+
+            single_dataset_train = create_dataset(
+                dataset,
+                root=data_dir, split=args.train_split, is_training=True,
+                batch_size=args.batch_size, repeats=args.epoch_repeats)
+            wrapped_dataset_train = OffsetDataset(single_dataset_train, label_offset=num_class_idx)
+            combined_train_dataset.append(wrapped_dataset_train)
+
+            if use_train_eval == 1:
+                single_dataset_eval = create_dataset(
+                    dataset, 
+                    root=data_dir, split=args.val_split, is_training=False, 
+                    batch_size=args.batch_size)
+                wrapped_dataset_eval = OffsetDataset(single_dataset_eval, label_offset=num_class_idx)
+                combined_eval_dataset.append(wrapped_dataset_eval)
+            
+            num_class_idx += num_classes
+
+        dataset_train = ConcatDatasetWithAttrs(combined_train_dataset)
+        dataset_eval = ConcatDatasetWithAttrs(combined_eval_dataset)
+
+        # setup mixup / cutmix
+        collate_fn = None
+        mixup_fn = None
+        mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
+        if mixup_active:
+            mixup_args = dict(
+                mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
+                prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
+                label_smoothing=args.smoothing, num_classes=global_class_num)
+            if args.prefetcher:
+                assert not num_aug_splits  # collate conflict (need to support deinterleaving in collate mixup)
+                collate_fn = FastCollateMixup(**mixup_args)
+            else:
+                mixup_fn = Mixup(**mixup_args)
+
+        # wrap dataset in AugMix helper
+        if num_aug_splits > 1:
+            dataset_train = AugMixDataset(dataset_train, num_splits=num_aug_splits)
+
+        # create data loaders w/ augmentation pipeiine
+        train_interpolation = args.train_interpolation
+        if args.no_aug or not train_interpolation:
+            train_interpolation = data_config['interpolation']
+        loader_train = create_loader(
+            dataset_train,
+            input_size=data_config['input_size'],
+            batch_size=args.batch_size,
+            is_training=True,
+            use_prefetcher=args.prefetcher,
+            no_aug=args.no_aug,
+            re_prob=args.reprob,
+            re_mode=args.remode,
+            re_count=args.recount,
+            re_split=args.resplit,
+            scale=args.scale,
+            ratio=args.ratio,
+            hflip=args.hflip,
+            vflip=args.vflip,
+            color_jitter=args.color_jitter,
+            auto_augment=args.aa,
+            num_aug_splits=num_aug_splits,
+            interpolation=train_interpolation,
+            mean=data_config['mean'],
+            std=data_config['std'],
+            num_workers=args.workers,
+            distributed=args.distributed,
+            collate_fn=collate_fn,
+            pin_memory=args.pin_mem,
+            repeated_aug=args.repeated_aug
+        )
+
+        loader_eval = create_loader(
+            dataset_eval,
+            input_size=data_config['input_size'],
+            batch_size=args.validation_batch_size_multiplier * args.batch_size,
+            is_training=False,
+            use_prefetcher=args.prefetcher,
+            interpolation=data_config['interpolation'],
+            mean=data_config['mean'],
+            std=data_config['std'],
+            num_workers=args.workers,
+            distributed=args.distributed,
+            crop_pct=data_config['crop_pct'],
+            pin_memory=args.pin_mem,
+            )
 
     # setup learning rate schedule and starting epoch
     iter_per_epoch = len(loader_train)
@@ -492,6 +653,7 @@ def main():
         train_loss_fn = LabelSmoothingCrossEntropy(smoothing=args.smoothing).cuda()
     else:
         train_loss_fn = nn.CrossEntropyLoss().cuda()
+
     validate_loss_fn = nn.CrossEntropyLoss().cuda()
 
     # setup checkpoint saver and eval metric tracking
@@ -519,15 +681,19 @@ def main():
 
     try:
         for epoch in range(start_epoch, num_epochs):
-            if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
-                loader_train.sampler.set_epoch(epoch)
+
+            if args.webdataset is not True:
+                if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
+                    loader_train.sampler.set_epoch(epoch)
 
             train_metrics = train_one_epoch(
                 epoch, model, loader_train, optimizer, train_loss_fn, args,
                 lr_scheduler=lr_scheduler, saver=saver, output_dir=output_dir,
                 amp_autocast=amp_autocast, loss_scaler=loss_scaler, mixup_fn=mixup_fn)
 
-            eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
+            eval_metrics = validate(
+                model, loader_eval, validate_loss_fn, args, 
+                amp_autocast=amp_autocast)
 
             if lr_scheduler is not None:
                 # step LR for next epoch
@@ -584,6 +750,7 @@ def train_one_epoch(
     for batch_idx, (input, target) in enumerate(loader):
         last_batch = batch_idx == last_idx
         data_time_m.update(time.time() - end)
+
         if not args.prefetcher:
             input, target = input.cuda(), target.cuda()
             if mixup_fn is not None:

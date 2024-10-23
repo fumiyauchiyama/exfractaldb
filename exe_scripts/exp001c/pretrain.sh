@@ -1,10 +1,10 @@
 #!/bin/bash
 
-#$-l rt_F=8
+#$-l rt_F=2
 #$-l h_rt=24:00:00
 #$-l USE_SSH=1
 #$-j y
-#$-o output/exp001a/
+#$-o output/exp001c/
 #$-cwd
 
 source /etc/profile.d/modules.sh
@@ -53,7 +53,7 @@ EPOCHS=2
 # path to train dataset
 SOURCE_DATASET=/groups/gag51404/user/fumiyau/fdsl_language/libraries/exfractaldb/dataset/MVFractalDB-1000/images
 # output dir path
-OUT_DIR=./output/pretrain/exp001a
+OUT_DIR=./output/pretrain/exp001c
 # num of GPUs
 NGPUS=$NUM_GPUS
 # num of processes per node

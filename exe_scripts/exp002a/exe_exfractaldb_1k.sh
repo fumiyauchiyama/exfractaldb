@@ -1,10 +1,10 @@
 #!/bin/bash
 
-#$-l rt_F=8
-#$-l h_rt=24:00:00
+#$-l rt_F=16
+#$-l h_rt=96:00:00
 #$-l USE_SSH=1
 #$-j y
-#$-o output/exp001a/
+#$-o output/exp002a/
 #$-cwd
 
 source /etc/profile.d/modules.sh
@@ -40,8 +40,10 @@ while read -r line; do
 done <"$SGE_JOB_HOSTLIST" >"$HOSTFILE_NAME"
 
 # hyperparameters
+# exp name
+EXP_NAME=exp002a
 # model size
-MODEL=tiny
+MODEL=base
 # initial learning rate
 LR=1.0e-3
 # name of dataset
@@ -49,11 +51,11 @@ DATA_NAME=ExFractalDB
 # num of classes
 CLASSES=1000
 # num of epochs
-EPOCHS=2
+EPOCHS=90
 # path to train dataset
 SOURCE_DATASET=/groups/gag51404/user/fumiyau/fdsl_language/libraries/exfractaldb/dataset/MVFractalDB-1000/images
 # output dir path
-OUT_DIR=./output/pretrain/exp001a
+OUT_DIR=./output/pretrain/${EXP_NAME}
 # num of GPUs
 NGPUS=$NUM_GPUS
 # num of processes per node
@@ -78,3 +80,62 @@ mpirun -npernode $NPERNODE -np $NGPUS \
     -j 16 --eval-metric loss \
     --interval-saved-epochs 10 --output ${OUT_DIR} \
     --log-wandb
+
+
+
+
+
+# ======== parameter for pre-trained model ========
+# exp name
+EXP_NAME=$EXP_NAME
+# model size
+MODEL=$MODEL
+# initial learning rate for pre-train
+PRE_LR=$LR
+# name of dataset for pre-train
+PRE_DATA_NAME=$DATA_NAME
+# num of classes for pre-train
+PRE_CLASSES=$CLASSES
+# path to checkpoint of pre-trained model
+CP_PATH=./output/pretrain/${EXP_NAME}/pretrain_deit_${MODEL}_${PRE_DATA_NAME}${PRE_CLASSES}_${PRE_LR}/model_best.pth.tar
+
+# ======== parameter for fine-tuning ========
+# output dir path
+OUT_DIR=./output/finetune/${EXP_NAME}
+# path to fine-tune dataset
+SOURCE_DATASET_DIR=/groups/gag51404/dataset/ImageNet1k/.cache_timm
+# name of dataset
+DATA_NAME=ImageNet1k
+# initial learning rate
+LR=1.0e-3
+# num of classes
+CLASSES=1000
+# num of epochs
+EPOCHS=90
+# num of GPUs
+NGPUS=$NUM_GPUS
+# num of processes per node
+NPERNODE=$NUM_GPU_PER_NODE
+# local mini-batch size (global mini-batch size = NGPUS × LOCAL_BS)
+LOCAL_BS=64
+
+# environment variable which is the IP address of the machine in rank 0 (need only for multiple nodes)
+# MASTER_ADDR="192.168.1.1"
+
+mpirun -npernode $NPERNODE -np $NGPUS \
+    -hostfile $HOSTFILE_NAME \
+    -x MASTER_ADDR=$MASTER_ADDR \
+    -x MASTER_PORT=$MASTER_PORT \
+    python3 finetune.py ${SOURCE_DATASET_DIR} \
+    --dataset hfds/ILSVRC/imagenet-1k \
+    --model deit_${MODEL}_patch16_224 --experiment finetune_deit_${MODEL}_${DATA_NAME}_from_${PRE_DATA_NAME}${PRE_CLASSES}_${PRE_LR} \
+    --input-size 3 224 224 --num-classes ${CLASSES} \
+    --sched cosine_iter --epochs ${EPOCHS} --lr ${LR} --weight-decay 0.05 \
+    --batch-size ${LOCAL_BS} --opt adamw \
+    --warmup-epochs 5 --cooldown-epochs 0 \
+    --smoothing 0.1 --aa rand-m9-mstd0.5-inc1 \
+    --repeated-aug --mixup 0.8 --cutmix 1.0 \
+    --drop-path 0.1 --reprob 0.25 -j 16 \
+    --output ${OUT_DIR} \
+    --log-wandb \
+    --pretrained-path ${CP_PATH}
