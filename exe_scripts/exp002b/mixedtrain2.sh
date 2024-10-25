@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #$-l rt_F=16
-#$-l h_rt=120:00:00
+#$-l h_rt=72:00:00
 #$-l USE_SSH=1
 #$-j y
 #$-o output/exp002b/
@@ -88,4 +88,5 @@ mpirun -npernode $NPERNODE -np $NGPUS \
     --remode pixel --interpolation bicubic --hflip 0.0 \
     -j 16 --eval-metric loss \
     --interval-saved-epochs 10 --output ${OUT_DIR} \
-    --log-wandb
+    --log-wandb \
+    --resume /groups/gag51404/user/fumiyau/fdsl_language/libraries/exfractaldb/output/mixedtrain/exp002b/mixedtrain_deit_base_ExFractalDB2000_1.0e-3/checkpoint-39.pth.tar
